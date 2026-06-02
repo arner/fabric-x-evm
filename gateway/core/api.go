@@ -65,16 +65,18 @@ var logger = flogging.MustGetLogger("gateway.core")
 // contract, the gateway requests endorsement from a set of EVM endorsers. It then
 // submits a signed transaction with the read/writeset to the Fabric orderers.
 type Gateway struct {
-	submitter   Submitter
-	endorsers   *EndorsementClient
-	store       Store
-	chainID     *big.Int
-	ChainConfig *params.ChainConfig
-	Signer      types.Signer
-	TxQueue     TxQueueInterface
-	workerCount int
-	wg          sync.WaitGroup
-	stopOnce    sync.Once
+	submitter       Submitter
+	endorsers       *EndorsementClient
+	store           Store
+	chainID         *big.Int
+	ChainConfig     *params.ChainConfig
+	Signer          types.Signer
+	TxQueue         TxQueueInterface
+	workerCount     int
+	wg              sync.WaitGroup
+	stopOnce        sync.Once
+	batchSubmitter  *BatchSubmitter
+	endorsementChan chan sdk.Endorsement // Channel to send endorsements to BatchSubmitter
 }
 
 type Store interface {
@@ -94,7 +96,9 @@ type Store interface {
 
 // New creates a new Ethereum Gateway.
 // If txQueue is nil, NewTxQueue() will be used as the default.
-func New(ec *EndorsementClient, submitter Submitter, store Store, chainID int64, workerCount int, txQueue TxQueueInterface) (*Gateway, error) {
+// batchSubmitter is required and handles all endorsement submissions.
+// endorsementChan is the channel to send endorsements to the BatchSubmitter.
+func New(ec *EndorsementClient, submitter Submitter, store Store, chainID int64, workerCount int, txQueue TxQueueInterface, batchSubmitter *BatchSubmitter, endorsementChan chan sdk.Endorsement) (*Gateway, error) {
 	if workerCount <= 0 {
 		workerCount = 1
 	}
@@ -106,14 +110,16 @@ func New(ec *EndorsementClient, submitter Submitter, store Store, chainID int64,
 
 	cid := big.NewInt(chainID)
 	return &Gateway{
-		endorsers:   ec,
-		submitter:   submitter,
-		store:       store,
-		chainID:     cid,
-		ChainConfig: cmn.BuildChainConfig(chainID),
-		Signer:      types.LatestSignerForChainID(cid),
-		TxQueue:     txQueue,
-		workerCount: workerCount,
+		endorsers:       ec,
+		submitter:       submitter,
+		store:           store,
+		chainID:         cid,
+		ChainConfig:     cmn.BuildChainConfig(chainID),
+		Signer:          types.LatestSignerForChainID(cid),
+		TxQueue:         txQueue,
+		workerCount:     workerCount,
+		batchSubmitter:  batchSubmitter,
+		endorsementChan: endorsementChan,
 	}, nil
 }
 
@@ -150,11 +156,14 @@ func (g *Gateway) processTx(ctx context.Context, tx *types.Transaction) error {
 	if err != nil {
 		return err
 	}
-	if err := g.SubmitFabricTx(ctx, end); err != nil {
-		return err
-	}
 
-	return nil
+	// Send endorsement to BatchSubmitter via channel
+	select {
+	case g.endorsementChan <- end:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("context canceled while sending endorsement: %w", ctx.Err())
+	}
 }
 
 // SendTransaction runs geth-style pre-flight validation, then enqueues the tx
@@ -179,12 +188,20 @@ func (g *Gateway) ExecuteEthTx(ctx context.Context, tx *types.Transaction) (sdk.
 	return g.endorsers.ExecuteTransaction(ctx, tx)
 }
 
-// SubmitFabricTx submits a Fabric envelope.
+// SubmitFabricTx submits a Fabric envelope via the BatchSubmitter.
 func (g *Gateway) SubmitFabricTx(ctx context.Context, end sdk.Endorsement) error {
-	if err := g.submitter.Submit(ctx, end); err != nil {
-		return fmt.Errorf("submit: %w", err)
+	// Send endorsement to BatchSubmitter via channel
+	select {
+	case g.endorsementChan <- end:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("context canceled while sending endorsement: %w", ctx.Err())
 	}
-	return nil
+}
+
+// Submitter returns the underlying submitter for use by BatchSubmitter.
+func (g *Gateway) Submitter() Submitter {
+	return g.submitter
 }
 
 // ChainID returns the configured chainID for this deployment.
