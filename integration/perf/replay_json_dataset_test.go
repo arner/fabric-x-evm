@@ -65,31 +65,18 @@ func (t *TxCompletionTracker) Register(ethHash common.Hash) <-chan gwcore.TxNoti
 // and signals the corresponding worker via the completion channel.
 func (t *TxCompletionTracker) HandleTx(ctx context.Context, notifs []gwcore.TxNotification) error {
 	for _, notif := range notifs {
-		// Extract ethereum transaction hash from the notification
-		var ethTx types.Transaction
-		if err := ethTx.UnmarshalBinary(notif.EthTxBytes); err != nil {
-			// Log error but don't fail - this shouldn't happen in normal operation
-			fmt.Printf("TxCompletionTracker: failed to unmarshal eth tx: %v\n", err)
-			continue
-		}
-
-		ethHash := ethTx.Hash()
-
 		t.mu.Lock()
-		ch, exists := t.pending[ethHash]
+		ch, exists := t.pending[notif.EthTxHash]
 		if exists {
-			delete(t.pending, ethHash)
+			delete(t.pending, notif.EthTxHash)
 		}
 		t.mu.Unlock()
 
 		if exists {
-			// Send notification and close channel
 			ch <- notif
 			close(ch)
 		}
-		// If not exists, the transaction wasn't registered (shouldn't happen in normal flow)
 	}
-
 	return nil
 }
 

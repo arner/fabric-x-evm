@@ -11,7 +11,8 @@ networks:
 
 services:
   test-committer:
-    image: docker.io/hyperledger/fabric-x-committer-test-node:1.0.0
+    # image: docker.io/hyperledger/fabric-x-committer-test-node:1.0.0
+    image: docker.io/arner/committer-test-node:alltx # FIXME: temporary workaround, remove after https://github.com/hyperledger/fabric-x-committer/pull/620 is merged.
     pull_policy: missing
     restart: unless-stopped
     container_name: test-committer
