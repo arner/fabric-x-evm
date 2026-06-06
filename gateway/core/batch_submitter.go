@@ -9,6 +9,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
@@ -77,8 +78,10 @@ func (bs *BatchSubmitter) run(ctx context.Context) {
 }
 
 func (bs *BatchSubmitter) submitOne(ctx context.Context, end sdk.Endorsement) error {
+	var txid string
 	if bs.cache != nil {
-		txid, err := extractTxIDFromProposal(end.Proposal)
+		var err error
+		txid, err = extractTxIDFromProposal(end.Proposal)
 		if err != nil {
 			return fmt.Errorf("extract txid: %w", err)
 		}
@@ -90,7 +93,10 @@ func (bs *BatchSubmitter) submitOne(ctx context.Context, end sdk.Endorsement) er
 			return fmt.Errorf("add to cache: %w", err)
 		}
 	}
-	return bs.submitter.Submit(ctx, end)
+	t0 := time.Now()
+	err := bs.submitter.Submit(ctx, end)
+	batchLogger.Debugf("[SUBMIT] txid=%s submit_took=%v", txid, time.Since(t0))
+	return err
 }
 
 // extractTxIDFromProposal extracts the transaction ID from a proposal.

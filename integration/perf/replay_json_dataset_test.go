@@ -39,7 +39,7 @@ import (
 // It implements gwcore.TxHandler to receive notifications from the notification system.
 type TxCompletionTracker struct {
 	mu      sync.RWMutex
-	pending map[common.Hash]chan gwcore.TxNotification // eth hash -> completion channel
+	pending map[common.Hash]chan gwcore.TxNotification
 }
 
 // NewTxCompletionTracker creates a new tracker.
@@ -55,7 +55,6 @@ func (t *TxCompletionTracker) Register(ethHash common.Hash) <-chan gwcore.TxNoti
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Use buffered channel to avoid blocking the notifier goroutine
 	ch := make(chan gwcore.TxNotification, 1)
 	t.pending[ethHash] = ch
 	return ch
@@ -80,12 +79,11 @@ func (t *TxCompletionTracker) HandleTx(ctx context.Context, notifs []gwcore.TxNo
 	return nil
 }
 
-// Cleanup removes any pending registrations (useful for cleanup on shutdown).
+// Cleanup closes all pending channels and clears state.
 func (t *TxCompletionTracker) Cleanup() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Close all pending channels
 	for _, ch := range t.pending {
 		close(ch)
 	}
@@ -332,7 +330,6 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 						t.Logf("Transfer %d: SendTransaction error: %v", i, err)
 						panic(err) // Trigger the defer recovery
 					}
-
 					// Wait for transaction completion notification from the tracker
 					select {
 					case notif := <-completionCh:
@@ -470,7 +467,7 @@ func TestReplayJSONDataset(t *testing.T) {
 	// flogging.ActivateSpec("gateway.core.txqueue_v2=debug")
 
 	// Run the test with single worker configuration
-	_, _, _ = runReplayTest(t, 1, 1, loadReplayConfigFromEnv(t))
+	_, _, _ = runReplayTest(t, 1, 50, loadReplayConfigFromEnv(t))
 }
 
 type performanceResult struct {
