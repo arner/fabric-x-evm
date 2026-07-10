@@ -83,7 +83,6 @@ func NewEndorser(
 	end, err := endorser.New(
 		endorser.NewEVMEngine(network.Namespace, kvs, evmConfig, monotonicVersions),
 		builder,
-		network.ChainID,
 	)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create endorser: %w", err)

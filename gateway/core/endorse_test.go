@@ -69,7 +69,7 @@ func TestCallContract_Status201ReturnsRevertError(t *testing.T) {
 
 func TestCallContract_Status500IsGenericError(t *testing.T) {
 	c := newClient(&stubEndorser{callResp: &peer.ProposalResponse{
-		Response: &peer.Response{Status: common.StatusError, Message: "endorser dead"},
+		Response: &peer.Response{Status: common.StatusServerError, Message: "endorser dead"},
 	}})
 
 	_, err := c.CallContract(context.Background(), ethereum.CallMsg{}, nil)
@@ -89,7 +89,7 @@ func TestCallContract_Status500IsGenericError(t *testing.T) {
 
 func TestCallContract_Status400ReturnsExecutionError(t *testing.T) {
 	c := newClient(&stubEndorser{callResp: &peer.ProposalResponse{
-		Response: &peer.Response{Status: common.StatusEVMExecFailure, Message: "out of gas"},
+		Response: &peer.Response{Status: common.StatusExecFailure, Message: "out of gas"},
 	}})
 
 	_, err := c.CallContract(context.Background(), ethereum.CallMsg{}, nil)

@@ -26,7 +26,10 @@ import (
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
 
-// Endorser interface defines the contract for endorsement providers.
+// Endorser processes proposals into a ProposalResponse whose Status carries the
+// outcome (OK, revert, client error, server error). The error return is reserved
+// for transport/delivery failures — over gRPC it is the call status; the
+// in-process implementation always returns nil and reports faults via the Status.
 // This allows different implementations (e.g., local, gRPC client, mock).
 type Endorser interface {
 	ProcessEVMTransaction(ctx context.Context, inv endorsement.Invocation, ethTx *types.Transaction) (*peer.ProposalResponse, error)
@@ -81,11 +84,22 @@ func (e EndorsementClient) ExecuteTransaction(ctx context.Context, tx *types.Tra
 		processEndorsement := func(index int, endorser Endorser) {
 			pResp, err := endorser.ProcessEVMTransaction(ctx, inv, tx)
 			if err != nil {
-				errs[index] = fmt.Errorf("process EVM transaction: %w", err)
+				// A Go error is a transport/delivery failure (e.g. gRPC), not a tx outcome.
+				errs[index] = fmt.Errorf("call endorser: %w", err)
 				cancel() // signal other goroutines to stop early
 				return
 			}
-			res[index] = pResp
+			// Application outcomes ride in the status. A success and a revert are
+			// committed; a valid tx whose execution failed is endorsable here but
+			// not yet committed (a follow-up will mine it). An invalid (rejected) tx
+			// or a server fault is an error the caller must see.
+			switch pResp.Response.Status {
+			case common.StatusOK, common.StatusEVMRevert, common.StatusExecFailure:
+				res[index] = pResp
+			default:
+				errs[index] = fmt.Errorf("process EVM transaction: %s", pResp.Response.Message)
+				cancel()
+			}
 		}
 
 		if len(e.endorsers) > 1 {
@@ -125,7 +139,9 @@ func (e *EndorsementClient) CallContract(ctx context.Context, args ethereum.Call
 	if res.Response.Status == common.StatusEVMRevert {
 		return nil, &domain.RevertError{Reason: res.Response.Message, Data: res.Response.Payload}
 	}
-	if res.Response.Status == common.StatusEVMExecFailure {
+	// For a call, both a failed execution and a rejected tx are surfaced as an
+	// execution error (-32000); only the reverted case carries data.
+	if res.Response.Status == common.StatusExecFailure || res.Response.Status == common.StatusTxRejected {
 		return nil, &domain.ExecutionError{Message: res.Response.Message}
 	}
 	if res.Response.Status < 200 || res.Response.Status >= 400 {

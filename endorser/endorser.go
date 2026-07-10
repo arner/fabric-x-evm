@@ -11,11 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"regexp"
 
 	"github.com/ethereum/go-ethereum"
 	ethcommon "github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
@@ -35,9 +33,8 @@ type PeerConf struct {
 
 // Endorser implements the ProcessProposal API to simulate the execution of ethereum transaction
 type Endorser struct {
-	Engine    EVMEngineInterface // Exported to allow injection of wrappers
-	builder   endorsement.Builder
-	ethSigner types.Signer
+	Engine  EVMEngineInterface // Exported to allow injection of wrappers
+	builder endorsement.Builder
 }
 
 // EVMEngineInterface defines the interface for EVM execution engines.
@@ -56,41 +53,30 @@ type EVMEngineInterface interface {
 // Arguments:
 //   - `engine`:  Manages EVM execution and state reads.
 //   - `builder`: Creates the signed ProposalResponse.
-//   - `chainID`: Ethereum chain ID used to validate transaction signatures.
-func New(engine *EVMEngine, builder endorsement.Builder, chainID int64) (*Endorser, error) {
+func New(engine *EVMEngine, builder endorsement.Builder) (*Endorser, error) {
 	return &Endorser{
-		Engine:    engine,
-		builder:   builder,
-		ethSigner: types.LatestSignerForChainID(big.NewInt(chainID)),
+		Engine:  engine,
+		builder: builder,
 	}, nil
 }
 
 // ProcessEVMTransaction processes an Ethereum transaction and returns a signed proposal response.
-// Reverts are endorsed and submitted (so the receipt records status=0); pre-execution
-// failures (nonce, gas, signer, EIP-3860, etc.) are rejected before any envelope is cut.
+// Reverts are endorsed and submitted (so the receipt records status=0); client-caused failures
+// (invalid tx or failed execution) surface as a non-2xx status that CreateSignedTx won't submit.
 func (f *Endorser) ProcessEVMTransaction(ctx context.Context, inv endorsement.Invocation, ethTx *types.Transaction) (*peer.ProposalResponse, error) {
-	// Validate the ethereum transaction signature
-	if _, err := types.Sender(f.ethSigner, ethTx); err != nil {
-		return nil, fmt.Errorf("invalid ethereum signature: %w", err)
-	}
-
-	// Execute the transaction
+	// Signature and nonce are validated inside the engine during execution.
 	res, err := f.Engine.Execute(ctx, ethTx)
 	if err != nil {
-		// Distinguish between pre-execution validation errors and execution errors.
-		// Pre-execution errors (from ApplyMessage) indicate the transaction is invalid
-		// and should be rejected. Execution errors (from result.Err) indicate the
-		// transaction executed but failed, and should be included in the response.
-		if isPreExecutionError(err) {
-			// Pre-execution validation error: reject the transaction
-			return nil, err
-		}
-		// Execution error: include in response with error status
 		return response(nil, err), nil
 	}
 
-	// Build and sign the endorsement
-	return f.builder.Endorse(inv, res)
+	// Build and sign the endorsement. A signing failure is a server fault, so it
+	// rides in the response (500) like every other outcome, not as a Go error.
+	resp, err := f.builder.Endorse(inv, res)
+	if err != nil {
+		return response(nil, fmt.Errorf("endorse: %w", err)), nil
+	}
+	return resp, nil
 }
 
 // ProcessCall processes an Ethereum call (query) and returns a proposal response
@@ -131,13 +117,16 @@ func (f *Endorser) ProcessStateQuery(ctx context.Context, query common.StateQuer
 
 func response(res []byte, err error) *peer.ProposalResponse {
 	if err != nil {
-		// 201 marks an EVM revert: success-range so protoutil cuts a tx, but
-		// distinguishable from 200 so the gateway and committer can tell.
-		status := common.StatusError
+		// A revert is a committed outcome; an *execFailure is a valid tx whose EVM
+		// execution failed; a *txRejected is an invalid client tx; anything else is
+		// a server-side fault.
+		status := common.StatusServerError
 		if errors.Is(err, vm.ErrExecutionReverted) {
 			status = common.StatusEVMRevert
-		} else if isEVMExecutionFailure(err) {
-			status = common.StatusEVMExecFailure
+		} else if _, ok := errors.AsType[*execFailure](err); ok {
+			status = common.StatusExecFailure
+		} else if _, ok := errors.AsType[*txRejected](err); ok {
+			status = common.StatusTxRejected
 		}
 		return &peer.ProposalResponse{
 			Version: 1,
@@ -157,67 +146,4 @@ func response(res []byte, err error) *peer.ProposalResponse {
 			Payload: res,
 		},
 	}
-}
-
-func isEVMExecutionFailure(err error) bool {
-	if err == nil || errors.Is(err, vm.ErrExecutionReverted) {
-		return false
-	}
-	return errors.Is(err, vm.ErrOutOfGas) ||
-		errors.Is(err, vm.ErrCodeStoreOutOfGas) ||
-		errors.Is(err, vm.ErrMaxCodeSizeExceeded) ||
-		errors.Is(err, vm.ErrInvalidJump) ||
-		errors.Is(err, vm.ErrWriteProtection) ||
-		errors.Is(err, vm.ErrReturnDataOutOfBounds) ||
-		errors.Is(err, vm.ErrGasUintOverflow) ||
-		errors.Is(err, vm.ErrInvalidCode)
-}
-
-// isPreExecutionError checks if an error is a pre-execution validation error
-// that should reject the transaction, as opposed to an execution error that
-// should be included in the transaction result.
-//
-// According to go-ethereum's ApplyMessage documentation:
-// "An error always indicates a core error meaning that the message would always
-// fail for that particular state and would never be accepted within a block."
-//
-// Pre-execution errors include:
-// - Nonce errors (too low, too high)
-// - Insufficient funds
-// - Gas limit errors
-// - Init code size exceeded (EIP-3860)
-//
-// Execution errors (NOT pre-execution) include:
-// - Out of gas during execution
-// - Execution reverted
-// - Invalid opcode
-func isPreExecutionError(err error) bool {
-	// Check for pre-execution validation errors from core package
-	if errors.Is(err, core.ErrNonceTooLow) ||
-		errors.Is(err, core.ErrNonceTooHigh) ||
-		errors.Is(err, core.ErrNonceMax) ||
-		errors.Is(err, core.ErrGasLimitReached) ||
-		errors.Is(err, core.ErrInsufficientFundsForTransfer) ||
-		errors.Is(err, vm.ErrMaxInitCodeSizeExceeded) ||
-		errors.Is(err, core.ErrInsufficientFunds) ||
-		errors.Is(err, core.ErrGasUintOverflow) ||
-		errors.Is(err, core.ErrIntrinsicGas) ||
-		errors.Is(err, core.ErrTxTypeNotSupported) ||
-		errors.Is(err, core.ErrTipAboveFeeCap) ||
-		errors.Is(err, core.ErrTipVeryHigh) ||
-		errors.Is(err, core.ErrFeeCapVeryHigh) ||
-		errors.Is(err, core.ErrFeeCapTooLow) ||
-		errors.Is(err, core.ErrSenderNoEOA) ||
-		errors.Is(err, core.ErrBlobFeeCapTooLow) ||
-		errors.Is(err, core.ErrMissingBlobHashes) ||
-		errors.Is(err, core.ErrTooManyBlobs) ||
-		errors.Is(err, core.ErrBlobTxCreate) {
-		return true
-	}
-
-	// Check for blob validation errors that are created with fmt.Errorf
-	// Pattern: "blob <number> has invalid hash version"
-	errMsg := err.Error()
-	matched, _ := regexp.MatchString(`^blob \d+ has invalid hash version$`, errMsg)
-	return matched
 }

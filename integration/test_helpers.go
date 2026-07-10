@@ -623,7 +623,6 @@ func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, ev
 	end, err := endorser.New(
 		endorser.NewEVMEngine(namespace, db, evmConfig, monotonicVersions),
 		builder,
-		evmConfig.ChainConfig.ChainID.Int64(),
 	)
 	if err != nil {
 		t.Fatalf("endorser.New: %v", err)
