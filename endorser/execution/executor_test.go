@@ -4,7 +4,7 @@ Copyright IBM Corp. All Rights Reserved.
 SPDX-License-Identifier: LGPL-3.0-or-later
 */
 
-package endorser
+package execution
 
 import (
 	"testing"
@@ -22,7 +22,7 @@ func TestNewExecutor_WrapsStateDBWhenDebugEnabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kvs := NewVersionedDBWrapper(backend)
+	kvs := &testVersionedDBSnapshotter{db: backend}
 	cfg := EVMConfig{
 		ChainConfig: common.BuildChainConfig(4011),
 		DebugLogs:   true,
@@ -51,7 +51,7 @@ func TestExecute_MaxTxGas(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		kvs := NewVersionedDBWrapper(backend)
+		kvs := &testVersionedDBSnapshotter{db: backend}
 		cfg := EVMConfig{
 			ChainConfig: common.BuildChainConfig(4011),
 			MaxTxGas:    maxTxGas,
@@ -100,7 +100,7 @@ func TestNewExecutor_BareStateDBWhenDebugDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kvs := NewVersionedDBWrapper(backend)
+	kvs := &testVersionedDBSnapshotter{db: backend}
 	cfg := EVMConfig{
 		ChainConfig: common.BuildChainConfig(4011),
 		DebugLogs:   false,

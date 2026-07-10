@@ -4,10 +4,11 @@ Copyright IBM Corp. 2016 All Rights Reserved.
 SPDX-License-Identifier: LGPL-3.0-or-later
 */
 
-package endorser
+package core
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/big"
@@ -18,18 +19,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
-
-type Config struct {
-	Channel   string
-	Namespace string
-	Peer      PeerConf
-}
-type PeerConf struct {
-	Address string
-	TLSPath string
-}
 
 // Endorser implements the ProcessProposal API to simulate the execution of ethereum transaction
 type Endorser struct {
@@ -53,7 +45,7 @@ type EVMEngineInterface interface {
 // Arguments:
 //   - `engine`:  Manages EVM execution and state reads.
 //   - `builder`: Creates the signed ProposalResponse.
-func New(engine *EVMEngine, builder endorsement.Builder) (*Endorser, error) {
+func New(engine *execution.EVMEngine, builder endorsement.Builder) (*Endorser, error) {
 	return &Endorser{
 		Engine:  engine,
 		builder: builder,
@@ -107,7 +99,8 @@ func (f *Endorser) ProcessStateQuery(ctx context.Context, query common.StateQuer
 		if nonceErr != nil {
 			return response(nil, nonceErr), nil
 		}
-		res = uint64ToBytes(nonce)
+		res = make([]byte, 8)
+		binary.BigEndian.PutUint64(res, nonce)
 	default:
 		return response(nil, fmt.Errorf("unknown state query %d", query.Type)), nil
 	}
@@ -117,15 +110,15 @@ func (f *Endorser) ProcessStateQuery(ctx context.Context, query common.StateQuer
 
 func response(res []byte, err error) *peer.ProposalResponse {
 	if err != nil {
-		// A revert is a committed outcome; an *execFailure is a valid tx whose EVM
-		// execution failed; a *txRejected is an invalid client tx; anything else is
-		// a server-side fault.
+		// A revert is a committed outcome; an *execution.ExecFailure is a valid tx
+		// whose EVM execution failed; an *execution.TxRejected is an invalid client
+		// tx; anything else is a server-side fault.
 		status := common.StatusServerError
 		if errors.Is(err, vm.ErrExecutionReverted) {
 			status = common.StatusEVMRevert
-		} else if _, ok := errors.AsType[*execFailure](err); ok {
+		} else if _, ok := errors.AsType[*execution.ExecFailure](err); ok {
 			status = common.StatusExecFailure
-		} else if _, ok := errors.AsType[*txRejected](err); ok {
+		} else if _, ok := errors.AsType[*execution.TxRejected](err); ok {
 			status = common.StatusTxRejected
 		}
 		return &peer.ProposalResponse{

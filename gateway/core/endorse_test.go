@@ -17,6 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/endorser/api"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
@@ -37,7 +38,7 @@ func (s *stubEndorser) ProcessStateQuery(ctx context.Context, query common.State
 }
 
 func newClient(stub *stubEndorser) *EndorsementClient {
-	return &EndorsementClient{endorsers: []Endorser{stub}}
+	return &EndorsementClient{endorsers: []api.Service{stub}}
 }
 
 func TestCallContract_Status201ReturnsRevertError(t *testing.T) {

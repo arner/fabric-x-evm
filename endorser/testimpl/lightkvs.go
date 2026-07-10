@@ -12,7 +12,8 @@ import (
 	"maps"
 
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
-	"github.com/hyperledger/fabric-x-evm/endorser"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
+	"github.com/hyperledger/fabric-x-evm/endorser/storage"
 )
 
 var logger = flogging.MustGetLogger("endorser.testimpl.lightkvs")
@@ -21,13 +22,13 @@ var logger = flogging.MustGetLogger("endorser.testimpl.lightkvs")
 // It embeds the base LightKVS and adds methods for snapshot management and revert operations.
 // Uses the base LightKVS.NextIndex for sequential storage instead of ring buffer.
 type LightKVSExt struct {
-	*endorser.LightKVS
+	*storage.LightKVS
 }
 
 // NewLightKVSExt wraps an existing LightKVS with extended test-specific features.
 // The lightKVS parameter must not be nil.
 // Resets NextIndex to 0 for sequential storage mode.
-func NewLightKVSExt(lightKVS *endorser.LightKVS) *LightKVSExt {
+func NewLightKVSExt(lightKVS *storage.LightKVS) *LightKVSExt {
 	// Reset NextIndex to 0 for sequential storage (not ring buffer)
 	lightKVS.NextIndex.Store(0)
 	return &LightKVSExt{
@@ -41,7 +42,7 @@ func NewLightKVSExt(lightKVS *endorser.LightKVS) *LightKVSExt {
 // Otherwise, if the requested snapshot is in the past, the preserved snapshot is selected
 // by hop distance from the current block number.
 // Readers must call Close() when done to allow garbage collection of old snapshots.
-func (kvs *LightKVSExt) NewSnapshot(blockNumber uint64) (endorser.ReadStore, error) {
+func (kvs *LightKVSExt) NewSnapshot(blockNumber uint64) (execution.ReadStore, error) {
 	current := kvs.Current.Load()
 	count := int(kvs.NextIndex.Load())
 	availableBlocks := make([]uint64, 0, count+1)
@@ -59,7 +60,7 @@ func (kvs *LightKVSExt) NewSnapshot(blockNumber uint64) (endorser.ReadStore, err
 	if blockNumber == 0 || blockNumber >= current.BlockNumber {
 		logger.Debugf("LightKVSExt.NewSnapshot() returning current snapshot: requested=%d returned=%d available=%v",
 			blockNumber, current.BlockNumber, availableBlocks)
-		return &endorser.Reader{
+		return &storage.Reader{
 			Snapshot: current,
 			Kvs:      kvs.LightKVS,
 		}, nil
@@ -84,7 +85,7 @@ func (kvs *LightKVSExt) NewSnapshot(blockNumber uint64) (endorser.ReadStore, err
 
 	logger.Debugf("LightKVSExt.NewSnapshot() returning historical snapshot: requested=%d returned=%d distance=%d targetIndex=%d historyCount=%d available=%v",
 		blockNumber, snapshot.BlockNumber, distance, targetIndex, count, availableBlocks)
-	return &endorser.Reader{
+	return &storage.Reader{
 		Snapshot: snapshot,
 		Kvs:      kvs.LightKVS,
 	}, nil
@@ -92,7 +93,7 @@ func (kvs *LightKVSExt) NewSnapshot(blockNumber uint64) (endorser.ReadStore, err
 
 // Update atomically applies a batch of updates to the store.
 // This overrides the base Update to use sequential history storage instead of ring buffer.
-func (kvs *LightKVSExt) Update(updates []endorser.KeyValueVersion) error {
+func (kvs *LightKVSExt) Update(updates []storage.KeyValueVersion) error {
 	// Load current snapshot
 	oldSnapshot := kvs.Current.Load()
 
@@ -112,7 +113,7 @@ func (kvs *LightKVSExt) Update(updates []endorser.KeyValueVersion) error {
 			}
 
 			// Update: set new value (Value can be nil, which is a valid stored value)
-			newData[update.Key] = &endorser.ValueVersion{
+			newData[update.Key] = &storage.ValueVersion{
 				Value:    update.Value,
 				BlockNum: update.BlockNum,
 				TxNum:    update.TxNum,
@@ -144,7 +145,7 @@ func (kvs *LightKVSExt) Update(updates []endorser.KeyValueVersion) error {
 	if len(updates) > 0 {
 		blockNum = updates[0].BlockNum
 	}
-	newSnapshot := &endorser.Snapshot{
+	newSnapshot := &storage.Snapshot{
 		BlockNumber: blockNum,
 		Data:        newData,
 	}
@@ -204,7 +205,7 @@ func (kvs *LightKVSExt) RevertToBlock(blockNumber uint64) error {
 	logger.Debugf("LightKVSExt.RevertToBlock() searching history snapshots: %v", availableBlocks)
 
 	// Search through history snapshots for the requested block number
-	var targetSnapshot *endorser.Snapshot
+	var targetSnapshot *storage.Snapshot
 	targetIndex := -1
 	for i := range kvs.History {
 		snapshot := kvs.History[i].Load()
@@ -235,7 +236,7 @@ func (kvs *LightKVSExt) RevertToBlock(blockNumber uint64) error {
 			// Keep it with nil value but preserve version info from current ledger
 			logger.Debugf("LightKVSExt.RevertToBlock() key %s created after target, preserving with nil value: version=%d, blockNum=%d, txNum=%d, isDelete=false",
 				key, currentValue.Version, currentValue.BlockNum, currentValue.TxNum)
-			mergedData[key] = &endorser.ValueVersion{
+			mergedData[key] = &storage.ValueVersion{
 				Value:    nil, // Nil out the value
 				BlockNum: currentValue.BlockNum,
 				TxNum:    currentValue.TxNum,
@@ -257,7 +258,7 @@ func (kvs *LightKVSExt) RevertToBlock(blockNumber uint64) error {
 			deleteVersion := targetValue.Version + 1
 			logger.Debugf("LightKVSExt.RevertToBlock() key %s deleted after target, marking as deleted: version=%d, blockNum=%d, txNum=%d, isDelete=true",
 				key, deleteVersion, targetValue.BlockNum, targetValue.TxNum)
-			mergedData[key] = &endorser.ValueVersion{
+			mergedData[key] = &storage.ValueVersion{
 				Value:    targetValue.Value, // Keep target's value for reference
 				BlockNum: targetValue.BlockNum,
 				TxNum:    targetValue.TxNum,
@@ -270,7 +271,7 @@ func (kvs *LightKVSExt) RevertToBlock(blockNumber uint64) error {
 			// Use target's value but update version info from current
 			logger.Debugf("LightKVSExt.RevertToBlock() key %s exists in both, using target value with current version: version=%d, blockNum=%d, txNum=%d, isDelete=%v",
 				key, currentValue.Version, currentValue.BlockNum, currentValue.TxNum, currentValue.IsDelete)
-			mergedData[key] = &endorser.ValueVersion{
+			mergedData[key] = &storage.ValueVersion{
 				Value:    targetValue.Value,     // Use target's value (the reverted state)
 				BlockNum: currentValue.BlockNum, // Use current's version info
 				TxNum:    currentValue.TxNum,
@@ -282,7 +283,7 @@ func (kvs *LightKVSExt) RevertToBlock(blockNumber uint64) error {
 	}
 
 	// Create the merged snapshot
-	mergedSnapshot := &endorser.Snapshot{
+	mergedSnapshot := &storage.Snapshot{
 		BlockNumber: blockNumber,
 		Data:        mergedData,
 	}

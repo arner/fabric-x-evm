@@ -4,7 +4,7 @@ Copyright IBM Corp. All Rights Reserved.
 SPDX-License-Identifier: LGPL-3.0-or-later
 */
 
-package endorser
+package execution
 
 import (
 	"context"
@@ -23,7 +23,6 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 	fxcommon "github.com/hyperledger/fabric-x-evm/common"
-	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
 
@@ -36,18 +35,10 @@ type EVMConfig struct {
 	DebugLogs bool
 }
 
+// KVSSnapshotter is the port execution uses to obtain a versioned read snapshot
+// of the world state. storage.LightKVS and storage.VersionedDBWrapper implement it.
 type KVSSnapshotter interface {
 	NewSnapshot(blockNumber uint64) (ReadStore, error)
-}
-
-// KVS is implemented by both LightKVS and VersionedDBWrapper.
-// It combines snapshot reads, block handling, and lifecycle management.
-type KVS interface {
-	KVSSnapshotter
-	blocks.BlockHandler
-	blocks.RecordGetter
-	BlockNumber(context.Context) (uint64, error)
-	Close() error
 }
 
 // EVMEngine manages EVM execution and state reads for an endorser.
@@ -399,7 +390,7 @@ func (h *Executor) Send(tx *types.Transaction) ([]byte, error) {
 	msg, err := h.PrepareMessage(tx)
 	if err != nil {
 		// Invalid transaction rejected before execution (bad signature, nonce, ...).
-		return nil, &txRejected{err: err}
+		return nil, &TxRejected{err: err}
 	}
 
 	// Return the raw EVM result: on a revert that ret is the revert data (used to
@@ -448,13 +439,13 @@ func (h *Executor) ApplyMessage(msg *core.Message) ([]byte, error) {
 		// (nonce, funds, intrinsic gas, ...) and would never be accepted in a block.
 		// Snapshot revert mirrors geth.
 		h.state.RevertToSnapshot(snapshot)
-		return nil, &txRejected{err: err}
+		return nil, &TxRejected{err: err}
 	}
 
 	if result.Err != nil {
 		// The transaction is valid but its EVM execution failed. A revert is a
 		// committed outcome carrying a reason; other faults (out of gas, invalid
-		// opcode, ...) are execFailures. Both are distinct from a pre-execution
+		// opcode, ...) are ExecFailures. Both are distinct from a pre-execution
 		// rejection.
 		if errors.Is(result.Err, vm.ErrExecutionReverted) {
 			if reason, uErr := abi.UnpackRevert(result.ReturnData); uErr == nil {
@@ -462,25 +453,34 @@ func (h *Executor) ApplyMessage(msg *core.Message) ([]byte, error) {
 			}
 			return result.ReturnData, result.Err
 		}
-		return result.ReturnData, &execFailure{err: result.Err}
+		return result.ReturnData, &ExecFailure{err: result.Err}
 	}
 	return result.ReturnData, nil
 }
 
-// txRejected tags an invalid transaction rejected before execution (nonce, funds,
+// TxRejected tags an invalid transaction rejected before execution (nonce, funds,
 // intrinsic gas, signature, ...): it can never be included in a block, so the
 // caller sees an error rather than an endorsement.
-type txRejected struct{ err error }
+type TxRejected struct{ err error }
 
-func (e *txRejected) Error() string { return e.err.Error() }
-func (e *txRejected) Unwrap() error { return e.err }
+// NewTxRejected wraps err as a TxRejected fault. Exported for tests and callers
+// outside this package that need to construct one (the err field itself stays
+// unexported so callers always go through Unwrap()).
+func NewTxRejected(err error) *TxRejected { return &TxRejected{err: err} }
 
-// execFailure tags a valid transaction whose EVM execution faulted (out of gas,
+func (e *TxRejected) Error() string { return e.err.Error() }
+func (e *TxRejected) Unwrap() error { return e.err }
+
+// ExecFailure tags a valid transaction whose EVM execution faulted (out of gas,
 // invalid opcode, ...) — in Ethereum it is mined with a failed receipt, distinct
 // from a revert (which carries a reason) and from a pre-execution rejection. Both
 // wrap the original go-ethereum error so errors.Is/errors.As still match the
 // underlying value (e.g. vm.ErrOutOfGas).
-type execFailure struct{ err error }
+type ExecFailure struct{ err error }
 
-func (e *execFailure) Error() string { return e.err.Error() }
-func (e *execFailure) Unwrap() error { return e.err }
+// NewExecFailure wraps err as an ExecFailure fault. Exported for tests and
+// callers outside this package; see NewTxRejected for why err stays unexported.
+func NewExecFailure(err error) *ExecFailure { return &ExecFailure{err: err} }
+
+func (e *ExecFailure) Error() string { return e.err.Error() }
+func (e *ExecFailure) Unwrap() error { return e.err }

@@ -4,7 +4,7 @@ Copyright IBM Corp. All Rights Reserved.
 SPDX-License-Identifier: LGPL-3.0-or-later
 */
 
-package endorser
+package core
 
 import (
 	"context"
@@ -14,11 +14,12 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	ethcommon "github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
+	gethcore "github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
 
@@ -39,8 +40,8 @@ func TestResponseStatusEVMRevert(t *testing.T) {
 }
 
 func TestResponseStatusExecFailure(t *testing.T) {
-	// A valid tx whose execution failed is tagged *execFailure.
-	resp := response(nil, &execFailure{err: vm.ErrOutOfGas})
+	// A valid tx whose execution failed is tagged *execution.ExecFailure.
+	resp := response(nil, execution.NewExecFailure(vm.ErrOutOfGas))
 
 	if resp.Response.Status != common.StatusExecFailure {
 		t.Fatalf("status = %d, want %d", resp.Response.Status, common.StatusExecFailure)
@@ -48,8 +49,8 @@ func TestResponseStatusExecFailure(t *testing.T) {
 }
 
 func TestResponseStatusTxRejected(t *testing.T) {
-	// An invalid tx rejected before execution is tagged *txRejected.
-	resp := response(nil, &txRejected{err: core.ErrNonceTooLow})
+	// An invalid tx rejected before execution is tagged *execution.TxRejected.
+	resp := response(nil, execution.NewTxRejected(gethcore.ErrNonceTooLow))
 
 	if resp.Response.Status != common.StatusTxRejected {
 		t.Fatalf("status = %d, want %d", resp.Response.Status, common.StatusTxRejected)
@@ -103,7 +104,7 @@ func processEVMTxWithEngineErr(t *testing.T, execErr error) *peer.ProposalRespon
 
 // A valid tx whose execution failed surfaces as StatusExecFailure (endorsable).
 func TestProcessEVMTransaction_ExecFailure(t *testing.T) {
-	resp := processEVMTxWithEngineErr(t, &execFailure{err: vm.ErrOutOfGas})
+	resp := processEVMTxWithEngineErr(t, execution.NewExecFailure(vm.ErrOutOfGas))
 
 	if resp.Response.Status != common.StatusExecFailure {
 		t.Fatalf("status = %d, want %d (StatusExecFailure)", resp.Response.Status, common.StatusExecFailure)
@@ -112,7 +113,7 @@ func TestProcessEVMTransaction_ExecFailure(t *testing.T) {
 
 // An invalid tx surfaces as StatusTxRejected so the caller is told to fix it.
 func TestProcessEVMTransaction_TxRejected(t *testing.T) {
-	resp := processEVMTxWithEngineErr(t, &txRejected{err: core.ErrNonceTooLow})
+	resp := processEVMTxWithEngineErr(t, execution.NewTxRejected(gethcore.ErrNonceTooLow))
 
 	if resp.Response.Status != common.StatusTxRejected {
 		t.Fatalf("status = %d, want %d (StatusTxRejected)", resp.Response.Status, common.StatusTxRejected)
