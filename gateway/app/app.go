@@ -25,7 +25,7 @@ import (
 
 	endorserapi "github.com/hyperledger/fabric-x-evm/endorser/api"
 	eapp "github.com/hyperledger/fabric-x-evm/endorser/app"
-	endorsertestimpl "github.com/hyperledger/fabric-x-evm/endorser/testimpl"
+	"github.com/hyperledger/fabric-x-evm/endorser/storage"
 	"github.com/hyperledger/fabric-x-evm/gateway/api"
 	"github.com/hyperledger/fabric-x-evm/gateway/config"
 	"github.com/hyperledger/fabric-x-evm/gateway/core"
@@ -164,15 +164,15 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 			return nil, fmt.Errorf("failed to load test accounts: %w", err)
 		}
 
-		lightKVSExt, ok := lightKVS.(*endorsertestimpl.LightKVSExt)
+		revertibleKVS, ok := lightKVS.(storage.Revertible)
 		if !ok {
-			return nil, fmt.Errorf("test RPC enabled but lightKVS is not LightKVSExt")
+			return nil, fmt.Errorf("test RPC enabled but lightKVS is not Revertible")
 		}
 
 		// Wrap the chain's store with SnapshotStore for snapshot/revert functionality
 		snapshotStore := testimpl.NewSnapshotStore(chain.Store)
 
-		rpcServer, err = testimpl.NewTestServer(gateway, testAccountMgr.Addresses, testAccountMgr.PrivateKeys, lightKVSExt, snapshotStore)
+		rpcServer, err = testimpl.NewTestServer(gateway, testAccountMgr.Addresses, testAccountMgr.PrivateKeys, revertibleKVS, snapshotStore)
 		if err != nil {
 			return nil, err
 		}

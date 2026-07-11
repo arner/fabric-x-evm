@@ -14,7 +14,6 @@ import (
 	"github.com/hyperledger/fabric-x-evm/endorser/core"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/endorser/storage"
-	"github.com/hyperledger/fabric-x-evm/endorser/testimpl"
 	sdk "github.com/hyperledger/fabric-x-sdk"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 	efab "github.com/hyperledger/fabric-x-sdk/endorsement/fabric"
@@ -52,7 +51,7 @@ func NewEndorser(
 	case "memory":
 		baseLightKVS := storage.NewLightKVS(cfg.Database.HistorySize)
 		if testImpl {
-			kvs = testimpl.NewLightKVSExt(baseLightKVS)
+			kvs = storage.NewRevertibleLightKVS(baseLightKVS)
 		} else {
 			kvs = baseLightKVS
 		}

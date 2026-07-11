@@ -17,7 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
-	endorsertestimpl "github.com/hyperledger/fabric-x-evm/endorser/testimpl"
+	"github.com/hyperledger/fabric-x-evm/endorser/storage"
 )
 
 var hardhatLogger = flogging.MustGetLogger("gateway.testimpl.hardhat")
@@ -54,7 +54,7 @@ func (api *HardhatAPI) SetCode(ctx context.Context, address common.Address, code
 // be enabled in production environments.
 type EvmAPI struct {
 	mu       sync.Mutex
-	lightKVS *endorsertestimpl.LightKVSExt
+	lightKVS storage.Revertible
 	store    interface {
 		Snapshot(ctx context.Context) (uint64, error)
 		RevertToSnapshot(ctx context.Context, blockNumber uint64) error
@@ -64,11 +64,10 @@ type EvmAPI struct {
 }
 
 // NewEvmAPI creates a new EVM API instance with LightKVS and Store for state management.
-func NewEvmAPI(lightKVS *endorsertestimpl.LightKVSExt, store interface {
+func NewEvmAPI(lightKVS storage.Revertible, store interface {
 	Snapshot(ctx context.Context) (uint64, error)
 	RevertToSnapshot(ctx context.Context, blockNumber uint64) error
 }) *EvmAPI {
-	// Wrap the base LightKVS in LightKVSExt to get extended functionality
 	return &EvmAPI{
 		lightKVS:  lightKVS,
 		store:     store,
