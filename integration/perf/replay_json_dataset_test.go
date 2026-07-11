@@ -27,7 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	fxcommon "github.com/hyperledger/fabric-x-evm/common"
-	endorserapi "github.com/hyperledger/fabric-x-evm/endorser/api"
+	eapi "github.com/hyperledger/fabric-x-evm/endorser/api"
 	econf "github.com/hyperledger/fabric-x-evm/endorser/config"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/endorser/storage"
@@ -95,7 +95,7 @@ func (t *TxCompletionTracker) HandleTx(ctx context.Context, notifs []fxcommon.Tx
 
 // balancePrimingEndorserFactory creates endorsers with balance priming support for testing.
 func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig) integration.EndorserFactory {
-	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, endorserapi.Service) {
+	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, eapi.Service) {
 		// Create the base endorser components
 		db, builder, baseEndorser := integration.NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
 

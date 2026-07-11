@@ -31,9 +31,9 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric-x-common/protoutil"
 	"github.com/hyperledger/fabric-x-evm/common"
-	endorserapi "github.com/hyperledger/fabric-x-evm/endorser/api"
+	eapi "github.com/hyperledger/fabric-x-evm/endorser/api"
 	econf "github.com/hyperledger/fabric-x-evm/endorser/config"
-	endorsercore "github.com/hyperledger/fabric-x-evm/endorser/core"
+	ecore "github.com/hyperledger/fabric-x-evm/endorser/core"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/endorser/storage"
 	gwapi "github.com/hyperledger/fabric-x-evm/gateway/api"
@@ -122,13 +122,13 @@ func (th *TestHarness) PrimeStateFromJSON(ctx context.Context, jsonFilePath stri
 //
 // If useNotifications is true, uses NotificationDispatcher + MemoryStore instead of
 // Synchronizer + Chain. This is intended for fabric-x performance testing.
-func buildTestHarness(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, ends []endorserapi.Service, dbs []storage.KVS, builders []endorsement.Builder, txQueue core.TxQueueInterface, useNotifications bool) (*TestHarness, *network.Synchronizer, error) {
+func buildTestHarness(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, ends []eapi.Service, dbs []storage.KVS, builders []endorsement.Builder, txQueue core.TxQueueInterface, useNotifications bool) (*TestHarness, *network.Synchronizer, error) {
 	return buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDBPath, bypass, ends, dbs, builders, txQueue, useNotifications, nil)
 }
 
 // buildTestHarnessWithExtraHandler is like buildTestHarness but accepts an optional extra TxHandler
 // that will be inserted into the notification handler chain right before the cleanup handler.
-func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, ends []endorserapi.Service, dbs []storage.KVS, builders []endorsement.Builder, txQueue core.TxQueueInterface, useNotifications bool, extraHandler common.TxHandler) (*TestHarness, *network.Synchronizer, error) {
+func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, ends []eapi.Service, dbs []storage.KVS, builders []endorsement.Builder, txQueue core.TxQueueInterface, useNotifications bool, extraHandler common.TxHandler) (*TestHarness, *network.Synchronizer, error) {
 	// Build gateway signer.
 	var gwSigner sdk.Signer
 	if cfg.Gateway.Identity.MSPDir != "" {
@@ -347,14 +347,14 @@ func applyConfigOverrides(cfg *config.Config, overrides map[string]any) error {
 }
 
 // EndorserFactory is a function that creates an endorser along with its dependencies.
-// It returns the endorserapi.Service interface which both *endorsercore.Endorser and *testimpl.EndorserWrapper implement.
-type EndorserFactory func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, endorserapi.Service)
+// It returns the eapi.Service interface which both *ecore.Endorser and *testimpl.EndorserWrapper implement.
+type EndorserFactory func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, eapi.Service)
 
 // buildEndorsers creates endorsers using the provided factory function.
-func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConfig, factory EndorserFactory) ([]storage.KVS, []endorsement.Builder, []endorserapi.Service) {
+func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConfig, factory EndorserFactory) ([]storage.KVS, []endorsement.Builder, []eapi.Service) {
 	dbs := make([]storage.KVS, len(cfg.Endorsers))
 	builders := make([]endorsement.Builder, len(cfg.Endorsers))
-	ends := make([]endorserapi.Service, len(cfg.Endorsers))
+	ends := make([]eapi.Service, len(cfg.Endorsers))
 	for i, ecfg := range cfg.Endorsers {
 		dbs[i], builders[i], ends[i] = factory(t, ecfg, cfg.Network.Channel, cfg.Network.Namespace, evmConfig, cfg.Network.Protocol)
 	}
@@ -362,7 +362,7 @@ func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConf
 }
 
 // defaultEndorserFactory creates regular endorsers without wrapping.
-func defaultEndorserFactory(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, endorserapi.Service) {
+func defaultEndorserFactory(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, eapi.Service) {
 	db, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
 	return db, builder, end
 }
@@ -583,7 +583,7 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 
 // NewEndorser creates an endorser with its dependencies.
 // Exported for use by custom endorser factories.
-func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, *endorsercore.Endorser) {
+func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, *ecore.Endorser) {
 	t.Helper()
 
 	var signer sdk.Signer
@@ -623,7 +623,7 @@ func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, ev
 		t.Fatalf("unsupported protocol: %q", protocol)
 	}
 
-	end, err := endorsercore.New(
+	end, err := ecore.New(
 		execution.NewEVMEngine(namespace, db, evmConfig, monotonicVersions),
 		builder,
 	)
@@ -639,7 +639,7 @@ func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, ev
 type TestHarness struct {
 	DBs            []storage.KVS
 	Gateways       []*core.Gateway
-	endorsers      []endorserapi.Service
+	endorsers      []eapi.Service
 	ethChainConfig *params.ChainConfig
 	Primer         *StatePrimer
 }
