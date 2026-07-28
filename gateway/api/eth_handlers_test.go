@@ -9,12 +9,15 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	gethmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/filters"
@@ -29,6 +32,18 @@ var (
 	latestBlockRef = rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
 	errBoom        = errors.New("boom")
 )
+
+// assertInvalidParams fails unless err is a JSON-RPC -32602. what identifies the input under test.
+func assertInvalidParams(t *testing.T, err error, what string) {
+	t.Helper()
+	var rpcErr rpc.Error
+	if !errors.As(err, &rpcErr) {
+		t.Fatalf("%s: error = %T (%v), want rpc.Error", what, err, err)
+	}
+	if rpcErr.ErrorCode() != -32602 {
+		t.Errorf("%s: code = %d, want -32602 (InvalidParams)", what, rpcErr.ErrorCode())
+	}
+}
 
 // mustBlock returns a fully populated domain.Block so rpcBlock() marshalling
 // can convert every []byte to common.Hash without panicking.
@@ -292,13 +307,7 @@ func TestGetStorageAt_SlotEncodings(t *testing.T) {
 			b := &stubBackend{storage: []byte{0xde, 0xad}}
 			_, err := NewEthAPI(b).GetStorageAt(context.Background(), testAddr, tt.slot, latestBlockRef)
 			if tt.wantErr {
-				var rpcErr rpc.Error
-				if !errors.As(err, &rpcErr) {
-					t.Fatalf("GetStorageAt(%q) error = %T (%v), want rpc.Error", tt.slot, err, err)
-				}
-				if rpcErr.ErrorCode() != -32602 {
-					t.Errorf("code = %d, want -32602 (InvalidParams)", rpcErr.ErrorCode())
-				}
+				assertInvalidParams(t, err, fmt.Sprintf("GetStorageAt(%q)", tt.slot))
 				return
 			}
 			if err != nil {
@@ -539,7 +548,7 @@ func TestMaxPriorityFeePerGas_ReturnsZero(t *testing.T) {
 
 func TestFeeHistory_ShapesArrays(t *testing.T) {
 	api := NewEthAPI(&stubBackend{})
-	got, err := api.FeeHistory(context.Background(), hexutil.Uint(3), rpc.LatestBlockNumber, []float64{25, 50, 75})
+	got, err := api.FeeHistory(context.Background(), 3, rpc.LatestBlockNumber, []float64{25, 50, 75})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -564,7 +573,7 @@ func TestFeeHistory_ShapesArrays(t *testing.T) {
 
 func TestFeeHistory_NoPercentiles(t *testing.T) {
 	api := NewEthAPI(&stubBackend{})
-	got, err := api.FeeHistory(context.Background(), hexutil.Uint(2), rpc.LatestBlockNumber, nil)
+	got, err := api.FeeHistory(context.Background(), 2, rpc.LatestBlockNumber, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -574,6 +583,50 @@ func TestFeeHistory_NoPercentiles(t *testing.T) {
 }
 
 // ---- Logs ----
+
+// blockCount sizes the response slices directly, so an unbounded count would OOM.
+func TestFeeHistory_ClampsBlockCount(t *testing.T) {
+	api := NewEthAPI(&stubBackend{})
+	got, err := api.FeeHistory(context.Background(), gethmath.HexOrDecimal64(1<<40), rpc.LatestBlockNumber, nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if len(got.GasUsedRatio) != maxFeeHistory {
+		t.Errorf("GasUsedRatio len = %d, want %d", len(got.GasUsedRatio), maxFeeHistory)
+	}
+	if len(got.BaseFee) != maxFeeHistory+1 {
+		t.Errorf("BaseFee len = %d, want %d", len(got.BaseFee), maxFeeHistory+1)
+	}
+}
+
+// geth takes math.HexOrDecimal64 here, so hex, decimal and unquoted counts all decode.
+func TestFeeHistory_BlockCountAcceptsHexAndDecimal(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want int
+	}{
+		{name: "quoted hex", raw: `"0x2"`, want: 2},
+		{name: "quoted decimal", raw: `"2"`, want: 2},
+		{name: "unquoted number", raw: `2`, want: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var blockCount gethmath.HexOrDecimal64
+			if err := json.Unmarshal([]byte(tt.raw), &blockCount); err != nil {
+				t.Fatalf("unmarshal %s: %v", tt.raw, err)
+			}
+			got, err := NewEthAPI(&stubBackend{}).FeeHistory(context.Background(), blockCount, rpc.LatestBlockNumber, nil)
+			if err != nil {
+				t.Fatalf("err: %v", err)
+			}
+			if len(got.GasUsedRatio) != tt.want {
+				t.Errorf("GasUsedRatio len = %d, want %d", len(got.GasUsedRatio), tt.want)
+			}
+		})
+	}
+}
 
 func TestGetLogs_Happy(t *testing.T) {
 	api := NewEthAPI(&stubBackend{
@@ -753,6 +806,55 @@ func TestArgsToCallMsg_HappyPathAllFields(t *testing.T) {
 	}
 	if msg.GasFeeCap.Int64() != 3 || msg.GasTipCap.Int64() != 2 {
 		t.Errorf("EIP-1559 fields not parsed: fee=%s tip=%s", msg.GasFeeCap, msg.GasTipCap)
+	}
+}
+
+// common.HexToAddress never fails, so a malformed address used to be accepted silently
+// and the call executed against a different address than the caller asked for.
+func TestArgsToCallMsg_MalformedAddressesAreInvalidParams(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		addr  string
+	}{
+		{name: "to not hex", field: "to", addr: "0xnonsense"},
+		{name: "to too short", field: "to", addr: "0x1234"},
+		{name: "to too long", field: "to", addr: "0xff0000000000000000000000000000000000000001"},
+		{name: "to missing 0x prefix", field: "to", addr: "2222222222222222222222222222222222222222"},
+		{name: "from not hex", field: "from", addr: "0xnonsense"},
+		{name: "from too long", field: "from", addr: "0xff0000000000000000000000000000000000000001"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := argsToCallMsg(map[string]any{tt.field: tt.addr})
+			assertInvalidParams(t, err, tt.field+"="+tt.addr)
+		})
+	}
+}
+
+// Args arrive as map[string]any straight from JSON, so a number stays a float64;
+// type-asserting it to string used to panic out through the RPC layer.
+func TestArgsToCallMsg_NonStringFieldsAreInvalidParams(t *testing.T) {
+	fields := []string{"from", "to", "gas", "gasPrice", "value", "input", "data", "maxFeePerGas", "maxPriorityFeePerGas"}
+
+	for _, field := range fields {
+		t.Run(field, func(t *testing.T) {
+			// float64 is what encoding/json produces for a JSON number.
+			_, err := argsToCallMsg(map[string]any{field: float64(21000)})
+			assertInvalidParams(t, err, field+"=<number>")
+		})
+	}
+}
+
+func TestArgsToCallMsg_AbsentAndNullQuantitiesStayNil(t *testing.T) {
+	msg, err := argsToCallMsg(map[string]any{"gasPrice": nil, "value": nil})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if msg.GasPrice != nil || msg.Value != nil || msg.GasFeeCap != nil || msg.GasTipCap != nil {
+		t.Errorf("want nil quantities, got gasPrice=%v value=%v fee=%v tip=%v",
+			msg.GasPrice, msg.Value, msg.GasFeeCap, msg.GasTipCap)
 	}
 }
 
