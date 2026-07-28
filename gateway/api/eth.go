@@ -8,9 +8,11 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -196,9 +198,33 @@ func (api *EthAPI) GetCode(ctx context.Context, addr common.Address, block rpc.B
 	return result, nil
 }
 
+// decodeStorageKey left-pads a quantity-encoded storage slot to 32 bytes, as geth does.
+func decodeStorageKey(s string) (common.Hash, error) {
+	key := s
+	if strings.HasPrefix(key, "0x") || strings.HasPrefix(key, "0X") {
+		key = key[2:]
+	}
+	if len(key)%2 != 0 {
+		key = "0" + key
+	}
+	if len(key) > 2*common.HashLength {
+		return common.Hash{}, rpcerr.InvalidParams("storage key too long (want at most 32 bytes): %q", s)
+	}
+	b, err := hex.DecodeString(key)
+	if err != nil {
+		return common.Hash{}, rpcerr.InvalidParams("invalid hex in storage key: %q", s)
+	}
+	return common.BytesToHash(b), nil
+}
+
 // eth_getStorageAt
-func (api *EthAPI) GetStorageAt(ctx context.Context, addr common.Address, slot common.Hash, block rpc.BlockNumberOrHash) (hexutil.Bytes, error) {
-	logger.Debugf("EthAPI.GetStorageAt() called with addr=%s, slot=%s", addr.Hex(), slot.Hex())
+func (api *EthAPI) GetStorageAt(ctx context.Context, addr common.Address, hexSlot string, block rpc.BlockNumberOrHash) (hexutil.Bytes, error) {
+	logger.Debugf("EthAPI.GetStorageAt() called with addr=%s, slot=%s", addr.Hex(), hexSlot)
+	slot, err := decodeStorageKey(hexSlot)
+	if err != nil {
+		logger.Debugf("EthAPI.GetStorageAt() returning error: %v", err)
+		return nil, err
+	}
 	blockNum, err := api.blockNumberOrHashToBlockNumber(ctx, block)
 	if err != nil {
 		logger.Debugf("EthAPI.GetStorageAt() returning error: %v", err)
