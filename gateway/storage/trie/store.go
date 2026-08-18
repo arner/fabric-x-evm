@@ -67,6 +67,9 @@ func New(dbPath string, initialRoot common.Hash) (*Store, error) {
 	return &Store{diskdb: diskdb, db: db, root: initialRoot, persistent: persistent}, nil
 }
 
+// selfDestructMarkerPrefix flags a same-tx-created account that self-destructed (EIP-6780).
+const selfDestructMarkerPrefix = "sd:"
+
 // Commit applies the write sets of all valid transactions in the block to the MPT
 // and returns the resulting StateRoot.
 func (s *Store) Commit(ctx context.Context, block blocks.Block) (common.Hash, error) {
@@ -80,17 +83,33 @@ func (s *Store) Commit(ctx context.Context, block blocks.Block) (common.Hash, er
 
 	for _, tx := range block.Transactions {
 		if !tx.Valid {
-			// MVCC-rejected: Fabric did not apply this transaction's write set.
+			// Fabric did not apply this transaction's write set.
 			continue
 		}
 		for _, nsRWS := range tx.NsRWS {
+			// Self-destruct markers apply after this RWS's other writes: Result()
+			// keeps the full write history (Fabric's ledger wants that), so a
+			// destroyed address's pre-destruct field writes are still present in
+			// the set. Applying the wipe last discards them correctly for the
+			// common case (destruct, no recreate). A same-tx recreate after the
+			// destruct would be wiped too — a known limitation, not attempted here.
 			for _, w := range nsRWS.RWS.Writes {
-				applyWrite(sdb, w)
+				if !strings.HasPrefix(w.Key, selfDestructMarkerPrefix) {
+					applyWrite(sdb, w)
+				}
+			}
+			for _, w := range nsRWS.RWS.Writes {
+				if strings.HasPrefix(w.Key, selfDestructMarkerPrefix) {
+					applySelfDestruct(sdb, w)
+				}
 			}
 		}
 	}
 
-	newRoot, err := sdb.Commit(block.Number, true, true)
+	// noStorageWiping=false: SelfDestruct (via a self-destruct marker) can delete
+	// an account's already-committed storage subtree; geth's Commit rejects that
+	// wipe unless explicitly allowed.
+	newRoot, err := sdb.Commit(block.Number, true, false)
 	if err != nil {
 		return common.Hash{}, fmt.Errorf("state commit block %d: %w", block.Number, err)
 	}
@@ -127,6 +146,15 @@ func applyWrite(sdb *state.StateDB, w blocks.KVWrite) {
 	case strings.HasPrefix(w.Key, "str:"):
 		applyStorageWrite(sdb, w)
 	}
+}
+
+// applySelfDestruct handles a "sd:<hexAddr>" marker: a same-tx-created account
+// self-destructed (EIP-6780). Prior-block storage slots this transaction never
+// touched can't be enumerated from the write set, so this delegates to the real
+// trie's own SelfDestruct rather than trying to delete matching "str:" keys by hand.
+func applySelfDestruct(sdb *state.StateDB, w blocks.KVWrite) {
+	addr := common.HexToAddress(strings.TrimPrefix(w.Key, "sd:"))
+	sdb.SelfDestruct(addr)
 }
 
 // applyAccountWrite handles keys of the form "acc:<hexAddr>:<field>".
@@ -169,8 +197,8 @@ func applyAccountWrite(sdb *state.StateDB, w blocks.KVWrite) {
 
 // applyStorageWrite handles keys of the form "str:<hexAddr>:<hexSlot>".
 //
-// Encoding mirrors endorser/state.go SnapshotDB:
-// the value is []byte(value.Hex()), i.e. the ASCII hex string of a common.Hash.
+// Encoding mirrors endorser/execution/statedb.go StateDB.SetState:
+// the value is the raw 32-byte big-endian value (common.Hash.Bytes()).
 func applyStorageWrite(sdb *state.StateDB, w blocks.KVWrite) {
 	parts := strings.SplitN(w.Key, ":", 3)
 	if len(parts) != 3 {
@@ -182,6 +210,6 @@ func applyStorageWrite(sdb *state.StateDB, w blocks.KVWrite) {
 	if w.IsDelete {
 		sdb.SetState(addr, slot, common.Hash{})
 	} else {
-		sdb.SetState(addr, slot, common.HexToHash(string(w.Value)))
+		sdb.SetState(addr, slot, common.BytesToHash(w.Value))
 	}
 }

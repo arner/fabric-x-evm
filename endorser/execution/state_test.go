@@ -8,6 +8,7 @@ package execution
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -382,6 +383,10 @@ func TestSelfDestruct_NewContract_FullyDestroys(t *testing.T) {
 	if !db.GetBalance(contract).IsZero() {
 		t.Errorf("expected balance=0 after SelfDestruct, got %v", db.GetBalance(contract))
 	}
+
+	if !hasWrite(db.Result(), selfDestructMarkerKey(contract)) {
+		t.Error("expected Result() to include the self-destruct marker for a same-tx-created contract")
+	}
 }
 
 // EIP-6780: pre-existing contract has balance transferred but is NOT destroyed.
@@ -403,6 +408,66 @@ func TestSelfDestruct_PreExistingContract_OnlyTransfersBalance(t *testing.T) {
 	}
 	if !db.GetBalance(contract).IsZero() {
 		t.Errorf("expected balance=0 after SelfDestruct (balance always transfers), got %v", db.GetBalance(contract))
+	}
+
+	if hasWrite(db.Result(), selfDestructMarkerKey(contract)) {
+		t.Error("expected Result() to NOT include a self-destruct marker for a pre-existing contract")
+	}
+}
+
+// hasWrite reports whether rws.Writes contains a write for key.
+func hasWrite(rws blocks.ReadWriteSet, key string) bool {
+	return slices.ContainsFunc(rws.Writes, func(w blocks.KVWrite) bool { return w.Key == key })
+}
+
+// hasDelete reports whether rws.Writes contains a delete for key.
+func hasDelete(rws blocks.ReadWriteSet, key string) bool {
+	return slices.ContainsFunc(rws.Writes, func(w blocks.KVWrite) bool { return w.Key == key && w.IsDelete })
+}
+
+// EIP-161: an address touched by a mutating op (even a zero-value one, which
+// alone produces no write at all) that ends up empty gets explicit account-field
+// deletes from Finalise, so the pruning is durable in the RWS itself.
+func TestFinalise_PrunesTouchedEmptyAccount(t *testing.T) {
+	originalState, err := state.NewWriteDB(Channel, Db1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := snapshotDB(t, originalState, 0)
+
+	addr := newAddress()
+	db.AddBalance(addr, uint256.NewInt(0), tracing.BalanceChangeUnspecified) // touch only, no value
+
+	if before := db.Result(); len(before.Writes) != 0 {
+		t.Fatalf("expected no writes before Finalise, got %d", len(before.Writes))
+	}
+
+	db.Finalise(true)
+
+	rws := db.Result()
+	for _, field := range []string{"bal", "nonce", "code"} {
+		key := accKey(addr, field)
+		if !hasDelete(rws, key) {
+			t.Errorf("expected Finalise to emit an explicit delete for %s", key)
+		}
+	}
+}
+
+// A touched account that is NOT empty (has balance) must survive Finalise.
+func TestFinalise_LeavesNonEmptyAccountAlone(t *testing.T) {
+	originalState, err := state.NewWriteDB(Channel, Db1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := snapshotDB(t, originalState, 0)
+
+	addr := newAddress()
+	db.AddBalance(addr, uint256.NewInt(100), tracing.BalanceChangeUnspecified)
+
+	db.Finalise(true)
+
+	if got := db.GetBalance(addr); got.Cmp(uint256.NewInt(100)) != 0 {
+		t.Errorf("expected balance to survive Finalise, got %v", got)
 	}
 }
 

@@ -209,6 +209,7 @@ type StateDB struct {
 	refund           uint64
 	selfDestructed   map[common.Address]struct{}
 	newContracts     map[common.Address]struct{}                    // EIP-6780: contracts created in the current transaction
+	touched          map[common.Address]struct{}                    // EIP-161: addresses touched by a mutating op this transaction
 	accessList       *accessList                                    // EIP-2929/2930 access list (not persisted, reset per transaction)
 	transientStorage map[common.Address]map[common.Hash]common.Hash // EIP-1153 transient storage (not persisted, reset per transaction)
 
@@ -229,6 +230,7 @@ func NewStateDB(ctx context.Context, store ReadStore, namespace string, blockNum
 		monotonicVersions: monotonicVersions,
 		selfDestructed:    make(map[common.Address]struct{}),
 		newContracts:      make(map[common.Address]struct{}),
+		touched:           make(map[common.Address]struct{}),
 		accessList:        newAccessList(),
 		transientStorage:  make(map[common.Address]map[common.Hash]common.Hash),
 		journal:           make([]any, 0),
@@ -351,6 +353,7 @@ func (s *StateDB) putState(key string, value []byte) {
 
 // CreateAccount creates an account with zero balance and nonce.
 func (s *StateDB) CreateAccount(addr common.Address) {
+	s.touched[addr] = struct{}{}
 	s.putState(accKey(addr, "bal"), uint256ToBytes(uint256.NewInt(0)))
 	s.putState(accKey(addr, "nonce"), uint64ToBytes(0))
 	s.markNewContract(addr)
@@ -358,6 +361,7 @@ func (s *StateDB) CreateAccount(addr common.Address) {
 
 // CreateContract creates a contract account with empty code.
 func (s *StateDB) CreateContract(addr common.Address) {
+	s.touched[addr] = struct{}{}
 	s.putState(accKey(addr, "code"), []byte{})
 	s.markNewContract(addr)
 }
@@ -382,6 +386,9 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 
 // AddBalance adds balance to an account.
 func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
+	// Touch even at zero: a zero-value transfer still makes the account EIP-161
+	// eligible for pruning at end of tx (see Finalise), matching real geth.
+	s.touched[addr] = struct{}{}
 	if amount.IsZero() {
 		return *uint256.NewInt(0)
 	}
@@ -393,6 +400,7 @@ func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tr
 
 // SubBalance subtracts balance from an account.
 func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
+	s.touched[addr] = struct{}{}
 	if amount.IsZero() {
 		return *uint256.NewInt(0)
 	}
@@ -413,6 +421,7 @@ func (s *StateDB) GetNonce(addr common.Address) uint64 {
 
 // SetNonce sets the nonce of an account.
 func (s *StateDB) SetNonce(addr common.Address, nonce uint64, reason tracing.NonceChangeReason) {
+	s.touched[addr] = struct{}{}
 	s.putState(accKey(addr, "nonce"), uint64ToBytes(nonce))
 }
 
@@ -445,6 +454,7 @@ func (s *StateDB) GetCodeSize(addr common.Address) int {
 
 // SetCode sets the code of an account.
 func (s *StateDB) SetCode(addr common.Address, code []byte, reason tracing.CodeChangeReason) []byte {
+	s.touched[addr] = struct{}{}
 	prev := s.GetCode(addr)
 	s.putState(accKey(addr, "code"), code)
 	return prev
@@ -673,6 +683,14 @@ func (s *StateDB) RevertToSnapshot(revid int) {
 	s.validRevisions = s.validRevisions[:idx]
 }
 
+// selfDestructMarkerPrefix flags a same-tx-created account that self-destructed
+// (EIP-6780). Post-commit handlers should wipe the address's account+storage subtree.
+const selfDestructMarkerPrefix = "sd:"
+
+func selfDestructMarkerKey(addr common.Address) string {
+	return selfDestructMarkerPrefix + addr.Hex()
+}
+
 // Result returns the read-write set containing all non-reverted operations.
 func (s *StateDB) Result() blocks.ReadWriteSet {
 	reads := make(map[string]blocks.KVRead)
@@ -684,6 +702,9 @@ func (s *StateDB) Result() blocks.ReadWriteSet {
 			reads[e.read.Key] = e.read
 		case writeEntry:
 			writes[e.write.Key] = e.write
+		case selfDestructEntry:
+			key := selfDestructMarkerKey(e.addr)
+			writes[key] = blocks.KVWrite{Key: key, IsDelete: true}
 		}
 	}
 
@@ -805,7 +826,22 @@ func (s *StateDB) Witness() *stateless.Witness { return nil }
 
 func (s *StateDB) AccessEvents() *ethstate.AccessEvents { return nil }
 
-func (s *StateDB) Finalise(deleteEmptyObjects bool) *bal.StateAccessList { return nil }
+// Finalise implements EIP-161: any address touched by a mutating op this
+// transaction that ends up empty (zero balance, zero nonce, no code) gets its
+// account fields explicitly deleted, so the pruning is durable in the RWS
+// itself rather than relying on a replayer's own state object to infer it.
+func (s *StateDB) Finalise(deleteEmptyObjects bool) *bal.StateAccessList {
+	if deleteEmptyObjects {
+		for addr := range s.touched {
+			if s.Empty(addr) {
+				s.putState(accKey(addr, "bal"), nil)
+				s.putState(accKey(addr, "nonce"), nil)
+				s.putState(accKey(addr, "code"), nil)
+			}
+		}
+	}
+	return nil
+}
 
 func (s *StateDB) Touch(addr common.Address) {
 	// It doesn't affect the control flow, so we don't add a read dependency to the read/write set.

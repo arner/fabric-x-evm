@@ -57,8 +57,10 @@ func codeWrite(hexAddr string, code []byte) blocks.KVWrite {
 	return blocks.KVWrite{Key: "acc:" + hexAddr + ":code", Value: code}
 }
 
-func storageWrite(hexAddr, hexSlot, hexValue string) blocks.KVWrite {
-	return blocks.KVWrite{Key: "str:" + hexAddr + ":" + hexSlot, Value: []byte(hexValue)}
+// storageWrite mirrors endorser/execution/statedb.go StateDB.SetState's encoding:
+// the value is the raw 32-byte value (common.Hash.Bytes()), not its hex string.
+func storageWrite(hexAddr, hexSlot string, value common.Hash) blocks.KVWrite {
+	return blocks.KVWrite{Key: "str:" + hexAddr + ":" + hexSlot, Value: value.Bytes()}
 }
 
 func deleteWrite(key string) blocks.KVWrite {
@@ -182,7 +184,7 @@ func TestCommit_StorageSlot(t *testing.T) {
 
 	block := makeBlock(1, makeTx(true,
 		codeWrite(addr.Hex(), code),
-		storageWrite(addr.Hex(), slot.Hex(), value.Hex()),
+		storageWrite(addr.Hex(), slot.Hex(), value),
 	))
 	root, err := ts.Commit(t.Context(), block)
 	if err != nil {
@@ -192,6 +194,103 @@ func TestCommit_StorageSlot(t *testing.T) {
 	sdb := openStateAt(t, ts, root)
 	if got := sdb.GetState(addr, slot); got != value {
 		t.Errorf("storage: want %s, got %s", value, got)
+	}
+}
+
+func TestCommit_SelfDestructMarker_WipesAccount(t *testing.T) {
+	ts := newTestStore(t)
+	addr := common.HexToAddress("0x8888")
+	slot := common.HexToHash("0x01")
+
+	// Block 1: deploy code, set storage, fund balance and commit it.
+	block1 := makeBlock(1, makeTx(true,
+		balWrite(addr.Hex(), big.NewInt(500)),
+		nonceWrite(addr.Hex(), 1),
+		codeWrite(addr.Hex(), []byte{0x60, 0x80}),
+		storageWrite(addr.Hex(), slot.Hex(), common.HexToHash("0xff")),
+	))
+	if _, err := ts.Commit(t.Context(), block1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block 2: only the self-destruct marker, no other writes for this address.
+	block2 := makeBlock(2, makeTx(true, blocks.KVWrite{Key: "sd:" + addr.Hex(), IsDelete: true}))
+	root, err := ts.Commit(t.Context(), block2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sdb := openStateAt(t, ts, root)
+	if got := sdb.GetBalance(addr); !got.IsZero() {
+		t.Errorf("balance: want 0, got %s", got)
+	}
+	if got := sdb.GetNonce(addr); got != 0 {
+		t.Errorf("nonce: want 0, got %d", got)
+	}
+	if got := sdb.GetCode(addr); len(got) != 0 {
+		t.Errorf("code: want empty, got %x", got)
+	}
+	if got := sdb.GetState(addr, slot); got != (common.Hash{}) {
+		t.Errorf("storage slot: want zero, got %s", got)
+	}
+}
+
+func TestCommit_SelfDestructMarker_AppliesAfterSameTxWrites(t *testing.T) {
+	ts := newTestStore(t)
+	addr := common.HexToAddress("0x8889")
+	slot := common.HexToHash("0x01")
+
+	// Same transaction: create, write storage, then self-destruct (no recreate
+	// after). The marker must win regardless of where it falls in Result()'s
+	// write order.
+	block := makeBlock(1, makeTx(true,
+		codeWrite(addr.Hex(), []byte{0x60, 0x80}),
+		storageWrite(addr.Hex(), slot.Hex(), common.HexToHash("0xff")),
+		blocks.KVWrite{Key: "sd:" + addr.Hex(), IsDelete: true},
+	))
+	root, err := ts.Commit(t.Context(), block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sdb := openStateAt(t, ts, root)
+	if got := sdb.GetCode(addr); len(got) != 0 {
+		t.Errorf("code: want empty, got %x", got)
+	}
+	if got := sdb.GetState(addr, slot); got != (common.Hash{}) {
+		t.Errorf("storage slot: want zero, got %s", got)
+	}
+}
+
+// A self-destruct marker for one address must not touch a different address's
+// storage, even within the same write set.
+func TestCommit_SelfDestructMarker_DoesNotAffectOtherAccounts(t *testing.T) {
+	ts := newTestStore(t)
+	destroyed := common.HexToAddress("0x888a")
+	survivor := common.HexToAddress("0x888b")
+	slot := common.HexToHash("0x01")
+
+	block := makeBlock(1, makeTx(true,
+		codeWrite(destroyed.Hex(), []byte{0x60, 0x80}),
+		storageWrite(destroyed.Hex(), slot.Hex(), common.HexToHash("0xff")),
+		blocks.KVWrite{Key: "sd:" + destroyed.Hex(), IsDelete: true},
+		codeWrite(survivor.Hex(), []byte{0x60, 0x80}),
+		storageWrite(survivor.Hex(), slot.Hex(), common.HexToHash("0xff")),
+	))
+	root, err := ts.Commit(t.Context(), block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sdb := openStateAt(t, ts, root)
+	if got := sdb.GetCode(destroyed); len(got) != 0 {
+		t.Errorf("destroyed account code: want empty, got %x", got)
+	}
+	if got := sdb.GetCode(survivor); len(got) == 0 {
+		t.Error("survivor account code: want non-empty, got empty — marker leaked to an unrelated address")
+	}
+	if got := sdb.GetState(survivor, slot); got != common.HexToHash("0xff") {
+		t.Errorf("survivor storage slot: want 0xff, got %s — marker leaked to an unrelated address", got)
 	}
 }
 
@@ -231,7 +330,7 @@ func TestCommit_DeleteStorage(t *testing.T) {
 	// Set storage (with code so the account survives deleteEmptyObjects), then delete the slot.
 	block1 := makeBlock(1, makeTx(true,
 		codeWrite(addr.Hex(), code),
-		storageWrite(addr.Hex(), slot.Hex(), common.HexToHash("0xff").Hex()),
+		storageWrite(addr.Hex(), slot.Hex(), common.HexToHash("0xff")),
 	))
 	if _, err := ts.Commit(t.Context(), block1); err != nil {
 		t.Fatal(err)

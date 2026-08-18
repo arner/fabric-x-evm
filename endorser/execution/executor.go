@@ -89,6 +89,7 @@ func (e *EVMEngine) Execute(ctx context.Context, tx *types.Transaction, blockTim
 			return endorsement.ExecutionResult{}, err
 		}
 		// Revert: a committed outcome, endorsed as Status 201 with a revert event.
+		ex.state.Finalise(true)
 		event, mErr := fxcommon.MarshalRevert(ret, "", tx.Hash().Hex())
 		if mErr != nil {
 			return endorsement.ExecutionResult{}, fmt.Errorf("marshal revert event: %w", mErr)
@@ -101,6 +102,8 @@ func (e *EVMEngine) Execute(ctx context.Context, tx *types.Transaction, blockTim
 			Payload: ret,
 		}, nil
 	}
+
+	ex.state.Finalise(true)
 
 	var logs []byte
 	if l := ex.state.Logs(); len(l) > 0 {
