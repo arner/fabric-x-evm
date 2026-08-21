@@ -168,8 +168,7 @@ func TestReady_BeforeAndAfterSwitch(t *testing.T) {
 		recorder := &recordingHandler{}
 		h := newHybrid(t, delivery, peer, recorder)
 
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
+		ctx := t.Context()
 		go func() { _ = h.Start(ctx) }()
 
 		synctest.Wait()
@@ -205,8 +204,7 @@ func TestGate_DiscardsBatchWhileDeliveryBehind(t *testing.T) {
 		recorder := &recordingHandler{}
 		h := newHybrid(t, delivery, peer, recorder)
 
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
+		ctx := t.Context()
 		go func() { _ = h.Start(ctx) }()
 
 		synctest.Wait()
@@ -233,8 +231,7 @@ func TestGate_SwitchesAndForwardsWhenCaughtUp(t *testing.T) {
 		recorder := &recordingHandler{}
 		h := newHybrid(t, delivery, peer, recorder)
 
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
+		ctx := t.Context()
 		go func() { _ = h.Start(ctx) }()
 
 		synctest.Wait()
@@ -262,6 +259,153 @@ func TestGate_SwitchesAndForwardsWhenCaughtUp(t *testing.T) {
 			t.Fatal("delivery was not cancelled after switch")
 		}
 	})
+}
+
+// TestGate_SwitchesOnFreshBlockRace reproduces the continuous-traffic race: a
+// notification for block N arrives while delivery has only just reached N-1, not
+// yet N — the state that occurs on essentially every block under live traffic.
+// Before the fix (nDel >= batch.BlockNumber) this case never switched.
+func TestGate_SwitchesOnFreshBlockRace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		delivery := newFakeDelivery()
+		peer := newFakeNotifPeer()
+		recorder := &recordingHandler{}
+		h := newHybrid(t, delivery, peer, recorder)
+
+		ctx := t.Context()
+		go func() { _ = h.Start(ctx) }()
+
+		synctest.Wait()
+		<-delivery.started
+
+		// Delivery has only reached block 8 (height=9); notif sends block 10.
+		// nDel(8)+1=9 < 10, so this must still be discarded.
+		delivery.setReady(9)
+		time.Sleep(200 * time.Millisecond)
+		synctest.Wait()
+
+		peer.push(10, "tx-race-1")
+		synctest.Wait()
+
+		assert.Empty(t, recorder.received(), "batch still ahead of delivery must be discarded")
+		select {
+		case <-delivery.stopped:
+			t.Fatal("delivery must not be cancelled yet")
+		default:
+		}
+
+		// Delivery now reaches block 9 (height=10) — exactly one behind block 10,
+		// the state live traffic produces continuously. The old nDel >=
+		// batch.BlockNumber condition would discard this forever; the fixed
+		// nDel+1 >= batch.BlockNumber condition must switch here.
+		delivery.setReady(10)
+		time.Sleep(200 * time.Millisecond)
+		synctest.Wait()
+
+		peer.push(10, "tx-race-2")
+		synctest.Wait()
+
+		select {
+		case <-delivery.stopped:
+			// switch happened
+		case <-time.After(time.Second):
+			t.Fatal("delivery was not cancelled — switch did not fire on the N-1 race case")
+		}
+	})
+}
+
+// TestDispatch_OverlappingBlocksDispatchedOnce verifies that once switching
+// happens (now common after the notifGate fix), blocks landing in the
+// delivery/notification overlap window during teardown are each handled exactly
+// once, never twice, thanks to the dispatchMu-guarded lastDispatched in dispatch.
+func TestDispatch_OverlappingBlocksDispatchedOnce(t *testing.T) {
+	delivery := newFakeDelivery()
+	peer := newFakeNotifPeer()
+	recorder := &recordingHandler{}
+	h := newHybrid(t, delivery, peer, recorder)
+
+	shim := &deliveryShim{h: h}
+	adapter := &hybridAdapter{h: h}
+	ctx := context.Background()
+
+	// Blocks 1-2 arrive via delivery only, before any switch.
+	require.NoError(t, shim.Handle(ctx, blocks.Block{Number: 1}))
+	require.NoError(t, shim.Handle(ctx, blocks.Block{Number: 2}))
+
+	// Blocks 3-5 land in the post-switch race window: delivery (still finishing
+	// up) and notification (now live) dispatch them concurrently.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for n := uint64(3); n <= 5; n++ {
+			_ = shim.Handle(ctx, blocks.Block{Number: n})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for n := uint64(3); n <= 5; n++ {
+			_ = adapter.Handle(ctx, blocks.Block{Number: n})
+		}
+	}()
+	wg.Wait()
+
+	// Blocks 6-7 arrive via notification only, once delivery has been cancelled.
+	require.NoError(t, adapter.Handle(ctx, blocks.Block{Number: 6}))
+	require.NoError(t, adapter.Handle(ctx, blocks.Block{Number: 7}))
+
+	counts := make(map[uint64]int)
+	for _, b := range recorder.received() {
+		counts[b.Number]++
+	}
+	for n := uint64(1); n <= 7; n++ {
+		assert.Equal(t, 1, counts[n], "block %d must be dispatched exactly once", n)
+	}
+}
+
+// failNTimesHandler fails the first n calls to Handle, then succeeds on every
+// call after that. Records the block number of every call, including failures.
+type failNTimesHandler struct {
+	mu        sync.Mutex
+	remaining int
+	calls     []uint64
+}
+
+func (f *failNTimesHandler) Handle(_ context.Context, b blocks.Block) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, b.Number)
+	if f.remaining > 0 {
+		f.remaining--
+		return errors.New("transient failure")
+	}
+	return nil
+}
+
+// TestDispatch_FailedAttemptCanBeRetried verifies that a block whose handler
+// chain fails is NOT marked as dispatched, so a caller that retries the exact
+// same block (as the real delivery synchronizer does after a handler error —
+// it re-subscribes from the last persisted height and redelivers the block)
+// reaches the downstream handlers instead of being silently skipped as
+// "already dispatched". This is the case that would cause a permanently
+// missed block if lastDispatched were updated before handlers ran.
+func TestDispatch_FailedAttemptCanBeRetried(t *testing.T) {
+	delivery := newFakeDelivery()
+	peer := newFakeNotifPeer()
+	failing := &failNTimesHandler{remaining: 1}
+	recorder := &recordingHandler{}
+	h := newHybrid(t, delivery, peer, failing, recorder)
+
+	shim := &deliveryShim{h: h}
+	ctx := context.Background()
+
+	err := shim.Handle(ctx, blocks.Block{Number: 3})
+	require.Error(t, err)
+	assert.Empty(t, recorder.received(), "recorder must not see a block whose handler chain failed")
+
+	// Retry of the same block number, exactly as the real synchronizer would do.
+	require.NoError(t, shim.Handle(ctx, blocks.Block{Number: 3}))
+	assert.Len(t, recorder.received(), 1, "retried block must reach downstream handlers, not be skipped")
 }
 
 // TestStart_DeliveryErrorIsLogged verifies that a delivery error does not cause

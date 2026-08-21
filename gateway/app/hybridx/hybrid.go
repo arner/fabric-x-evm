@@ -14,8 +14,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 // any gap between the two phases:
 //
 //  1. The gate receives a batch for block B and updates nNot = B.
-//  2. If nDel >= nNot it atomically flips switched and forwards the batch.
-//  3. If nDel < nNot it discards the batch content (delivery is still behind).
+//  2. If nDel+1 >= nNot (delivery covers everything before B) it atomically
+//     flips switched and forwards the batch.
+//  3. Otherwise it discards the batch content (delivery is still behind).
 //
 // Because the decision and the first forward happen in the same HandleBatch call
 // there is no window in which a batch could be lost.
@@ -27,6 +28,7 @@ package hybridx
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +59,15 @@ type HybridSynchronizer struct {
 	delivery  deliverySyncer
 	notifPeer notification.AllTxPeer
 	notifReq  *notification.StreamAllRequest
+
+	// dispatchMu serializes dispatch calls from the delivery and notification
+	// paths (both can be live during the ~100ms teardown window after a switch)
+	// and guards lastDispatched, the highest block number fully handled so far
+	// (-1 means none yet). A block is recorded here only after every handler
+	// succeeds, so a failed attempt from either path can still be retried
+	// instead of being silently skipped as "already dispatched".
+	dispatchMu     sync.Mutex
+	lastDispatched int64
 }
 
 // New constructs a HybridSynchronizer.
@@ -74,6 +85,7 @@ func New(
 		logger:    logger,
 		handlers:  append([]blocks.BlockHandler(nil), handlers...),
 	}
+	h.lastDispatched = -1
 
 	delivery, err := nfabx.NewSynchronizer(db, channel, conf, signer, logger, &deliveryShim{h: h})
 	if err != nil {
@@ -105,22 +117,34 @@ func newWithDeps(
 	handlers ...blocks.BlockHandler,
 ) *HybridSynchronizer {
 	return &HybridSynchronizer{
-		logger:    logger,
-		handlers:  append([]blocks.BlockHandler(nil), handlers...),
-		delivery:  delivery,
-		notifPeer: notifPeer,
-		notifReq:  notifReq,
+		logger:         logger,
+		handlers:       append([]blocks.BlockHandler(nil), handlers...),
+		delivery:       delivery,
+		notifPeer:      notifPeer,
+		notifReq:       notifReq,
+		lastDispatched: -1,
 	}
 }
 
 // dispatch calls Handle on every handler in the chain.
-// Called by both the deliveryShim and the notifGate.
+// Called by both the deliveryShim and the notifGate — concurrently, near a
+// switch, from separate goroutines — so dispatchMu serializes attempts and a
+// block is recorded as dispatched only once every handler has returned nil.
 func (h *HybridSynchronizer) dispatch(ctx context.Context, b blocks.Block) error {
+	h.dispatchMu.Lock()
+	defer h.dispatchMu.Unlock()
+
+	if int64(b.Number) <= h.lastDispatched {
+		h.logger.Debugf("hybridx: skipping already-dispatched block %d", b.Number)
+		return nil
+	}
+
 	for _, bh := range h.handlers {
 		if err := bh.Handle(ctx, b); err != nil {
 			return err
 		}
 	}
+	h.lastDispatched = int64(b.Number)
 	return nil
 }
 
@@ -255,8 +279,8 @@ func (s *deliveryShim) Handle(ctx context.Context, b blocks.Block) error {
 //
 // For each incoming batch it:
 //  1. If switched: converts the batch to a blocks.Block and dispatches it.
-//  2. If not switched but nDel >= batch.BlockNumber: flips switched and dispatches
-//     — this is the gap-free handoff point.
+//  2. If not switched but nDel+1 >= batch.BlockNumber: flips switched and
+//     dispatches — this is the gap-free handoff point.
 //  3. Otherwise: discards the batch (delivery is still behind).
 type notifGate struct {
 	nDel       *atomic.Uint64
@@ -278,8 +302,9 @@ func (g *notifGate) HandleBatch(ctx context.Context, batch notification.AllTxBat
 		return g.dispatchBatch(ctx, batch)
 	}
 
-	// Check whether delivery has caught up with this batch's block number.
-	if g.nDel.Load() >= batch.BlockNumber {
+	// Delivery must cover everything strictly before this batch; this batch itself
+	// is about to be dispatched via notification, so nDel need only reach batch-1.
+	if g.nDel.Load()+1 >= batch.BlockNumber {
 		g.switched.Store(1)
 		g.logger.Infof("hybridx: switching to notification at block %d", batch.BlockNumber)
 		return g.dispatchBatch(ctx, batch)

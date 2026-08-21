@@ -9,6 +9,7 @@ package common
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
@@ -86,8 +87,17 @@ func (d *AllTxBatchDispatcher) HandleBatch(ctx context.Context, batch notificati
 
 	notifLogger.Debugf("[NOTIFY] block=%d dispatching=%d/%d txs", batch.BlockNumber, len(txs), len(batch.Events))
 
+	// TODO: StreamAllTransactions carries no block header, so there's no real hash to
+	// use here. Replace with the real hash once
+	// https://github.com/hyperledger/fabric-x-committer/issues/773 is implemented.
+	var parentNum uint64
+	if batch.BlockNumber > 0 {
+		parentNum = batch.BlockNumber - 1
+	}
 	b := blocks.Block{
 		Number:       batch.BlockNumber,
+		Hash:         blockNumberHash(batch.BlockNumber),
+		ParentHash:   blockNumberHash(parentNum),
 		Transactions: txs,
 	}
 
@@ -98,6 +108,13 @@ func (d *AllTxBatchDispatcher) HandleBatch(ctx context.Context, batch notificati
 	}
 
 	return nil
+}
+
+// blockNumberHash encodes n as a 32-byte big-endian hash-shaped placeholder.
+func blockNumberHash(n uint64) []byte {
+	h := make([]byte, 32)
+	binary.BigEndian.PutUint64(h[24:], n)
+	return h
 }
 
 // namespacesToNsRWS converts applicationpb.TxNamespace slices (as delivered by

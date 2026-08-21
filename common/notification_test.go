@@ -145,6 +145,8 @@ func TestHandleBatch_DispatchesOnlyEVMTxsFromMixedBatch(t *testing.T) {
 	require.Len(t, h.seen, 1, "one dispatched Block")
 	b := h.seen[0]
 	assert.Equal(t, uint64(42), b.Number)
+	assert.Equal(t, blockNumberHash(42), b.Hash)
+	assert.Equal(t, blockNumberHash(41), b.ParentHash)
 	require.Len(t, b.Transactions, 2, "only the two EVM txs make it through")
 
 	assert.Equal(t, "evm-1", b.Transactions[0].ID)
@@ -158,6 +160,25 @@ func TestHandleBatch_DispatchesOnlyEVMTxsFromMixedBatch(t *testing.T) {
 	assert.Equal(t, int64(2), b.Transactions[1].Number)
 	assert.False(t, b.Transactions[1].Valid, "non-COMMITTED tx has Valid=false")
 	assert.Equal(t, int(committerpb.Status_ABORTED_MVCC_CONFLICT), b.Transactions[1].Status)
+}
+
+func TestHandleBatch_BlockZeroParentHashDoesNotUnderflow(t *testing.T) {
+	// Block 0 realistically never reaches here (genesis has no EVM txs, so the
+	// len(txs)==0 guard returns early) but the parentNum computation must not
+	// wrap a uint64 to MaxUint64 if it ever does.
+	h := &stubHandler{}
+	d := NewAllTxBatchDispatcher(h)
+	err := d.HandleBatch(context.Background(), notification.AllTxBatch{
+		BlockNumber: 0,
+		Events: []notification.CommittedTxEvent{
+			{TxID: "evm-1", Status: committerpb.Status_COMMITTED,
+				Metadata: makeMetadata(t, ProposalTypeEVMTx, []byte{0xaa})},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, h.seen, 1)
+	assert.Equal(t, blockNumberHash(0), h.seen[0].Hash)
+	assert.Equal(t, blockNumberHash(0), h.seen[0].ParentHash, "parent of block 0 must not underflow")
 }
 
 func TestHandleBatch_MultipleHandlersAllReceive(t *testing.T) {
