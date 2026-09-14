@@ -154,7 +154,7 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 			continue
 		}
 		status := uint8(0)
-		if tx.Valid && !fc.IsRevertEvent(tx.Events) {
+		if tx.Valid && !fc.IsRevertEvent(tx.Events) && !fc.IsExecFailureEvent(tx.Events) {
 			status = 1
 		}
 
@@ -197,6 +197,7 @@ func convertTransaction(ethTxBytes []byte, blockHash []byte, blockNumber uint64,
 	hash := ethTx.Hash().Bytes()
 
 	var logs []domain.Log
+	// transactions with status 0 (revert, execution failure) never emit logs.
 	if ethStatus == 1 && len(events) > 0 {
 		rawLogs, err := fc.UnmarshalLogs(events)
 		if err != nil {
