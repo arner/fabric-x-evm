@@ -27,9 +27,8 @@ import (
 // (for block ingestion) and core.Store (via the embedded *storage.Store, for API queries).
 type Chain struct {
 	*storage.Store
-	db       *sql.DB
-	ts       *trie.Store
-	prevHash common.Hash // Ethereum hash of last committed block; seeded from DB on startup
+	db *sql.DB
+	ts *trie.Store
 }
 
 // NewChain opens the SQLite database and trie store, seeds state from the latest committed
@@ -48,12 +47,11 @@ func NewChain(dbConnStr, triePath string, withTrie bool) (*Chain, error) {
 		return nil, fmt.Errorf("init block store: %w", err)
 	}
 
-	// Seed trie root and parent hash from the latest committed block so state
-	// resumes correctly after a restart.
-	var initialRoot, prevHash common.Hash
+	// Seed the trie root from the latest committed block so state resumes
+	// correctly after a restart.
+	var initialRoot common.Hash
 	if latest, err := blockStore.LatestBlock(context.Background(), false); err == nil && latest != nil {
 		initialRoot = common.BytesToHash(latest.StateRoot)
-		prevHash = common.BytesToHash(latest.BlockHash)
 	}
 
 	var ts *trie.Store
@@ -65,13 +63,13 @@ func NewChain(dbConnStr, triePath string, withTrie bool) (*Chain, error) {
 		}
 	}
 
-	return &Chain{Store: blockStore, db: db, ts: ts, prevHash: prevHash}, nil
+	return &Chain{Store: blockStore, db: db, ts: ts}, nil
 }
 
 // Handle implements blocks.BlockHandler. Order matters: the trie
 // commits before InsertBlock, so a crash between them never leaves SQL ahead
-// of the MPT, and prevHash only advances after InsertBlock succeeds, so a
-// failed insert never publishes a tip the store doesn't hold.
+// of the MPT. The parent hash is read from the store, not cached, so it follows
+// the store when blocks are removed (evm_revert) and stays right on replay.
 //
 // Re-delivering an already-stored block is safe: the trie apply and
 // InsertBlock/InsertTransaction/InsertLog are all idempotent under replay.
@@ -97,11 +95,20 @@ func (c *Chain) Handle(ctx context.Context, b blocks.Block) error {
 	// DepGraphQueue sees the conflict and retries it.
 	ebl.Transactions = withoutRetriableConflicts(ebl.Transactions)
 
-	ebl.ParentHash = c.prevHash.Bytes()
+	parent, err := c.parentHash(ctx, b.Number)
+	if err != nil {
+		msg := fmt.Sprintf("Chain.Handle() block=%d parent hash lookup error: %v", b.Number, err)
+		logger.Warn(msg)
+		fc.DebugPanic(msg)
+		return err
+	}
+	ebl.ParentHash = parent
 	if c.ts != nil {
 		stateRoot, err := c.ts.Commit(ctx, b)
 		if err != nil {
-			logger.Warnf("Chain.Handle() block=%d trie commit error: %v", b.Number, err)
+			msg := fmt.Sprintf("Chain.Handle() block=%d trie commit error: %v", b.Number, err)
+			logger.Warn(msg)
+			fc.DebugPanic(msg)
 			return err // irrecoverable
 		}
 		ebl.StateRoot = stateRoot.Bytes()
@@ -110,12 +117,16 @@ func (c *Chain) Handle(ctx context.Context, b blocks.Block) error {
 	}
 
 	if err := c.Store.InsertBlock(ctx, ebl); err != nil {
-		logger.Warnf("Chain.Handle() block=%d insert error: %v", b.Number, err)
+		// The synchronizer retries a failing handler forever, so surface a
+		// permanent failure (e.g. a broken chain linkage) loudly in debug builds.
+		tip, _ := c.Store.BlockNumber(ctx)
+		msg := fmt.Sprintf("Chain.Handle() block=%d parent=%x store-tip=%d insert error: %v", b.Number, ebl.ParentHash, tip, err)
+		logger.Warn(msg)
+		fc.DebugPanic(msg)
 		return err
 	}
 
-	c.prevHash = common.BytesToHash(ebl.BlockHash)
-	logger.Debugf("Chain.Handle() block=%d committed prevHash=%s", b.Number, c.prevHash.Hex())
+	logger.Debugf("Chain.Handle() block=%d committed", b.Number)
 	return nil
 }
 
@@ -147,6 +158,23 @@ func withoutRetriableConflicts(txs []domain.Transaction) []domain.Transaction {
 	return kept
 }
 
+// parentHash is the hash of block number-1 as the store holds it, or the zero
+// hash for the first block (or when the store has no such block).
+func (c *Chain) parentHash(ctx context.Context, number uint64) ([]byte, error) {
+	zero := make([]byte, common.HashLength)
+	if number == 0 {
+		return zero, nil
+	}
+	h, err := c.Store.BlockHash(ctx, number-1)
+	if err != nil {
+		return nil, err
+	}
+	if h == nil {
+		return zero, nil
+	}
+	return h, nil
+}
+
 // EnsureGenesisBlock inserts an empty block 0 if the store has no blocks yet, so
 // eth_getBlockByNumber("latest") is never null before the first transaction commits.
 // Real Fabric/fabric-x channels always deliver a genesis block already; this is only
@@ -169,7 +197,6 @@ func (c *Chain) EnsureGenesisBlock(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	c.prevHash = common.BytesToHash(genesisHash)
 	return nil
 }
 
