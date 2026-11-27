@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 ---
-name: Release EVM Docker Image
+name: Release Chaguar EVM Docker Image
 
 on:
   push:
@@ -58,16 +58,15 @@ jobs:
       - name: Build cross-architecture binaries
         run: make build-release
 
-      - name: Set image metadata
+      - name: Set image prefix and metadata
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           echo "CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
           echo "REVISION=$(git rev-parse HEAD)" >> $GITHUB_ENV
-          if [ "$GITHUB_REPOSITORY_OWNER" == "hyperledger" ]; then
-            echo "IMAGE_PREFIX=hyperledger" >> $GITHUB_ENV
-          else
-            echo "IMAGE_PREFIX=${{ secrets.DOCKERHUB_USERNAME }}" >> $GITHUB_ENV
-          fi
-          echo "GHCR_PREFIX=$GITHUB_REPOSITORY_OWNER" >> $GITHUB_ENV
+          # Registry namespaces must stay lowercase; registries reject uppercase image references.
+          echo "IMAGE_PREFIX=${DOCKERHUB_USERNAME,,}" >> $GITHUB_ENV
+          echo "GHCR_PREFIX=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
 
       - name: Build and push multi-platform Docker image
         uses: docker/build-push-action@v6
